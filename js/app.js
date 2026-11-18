@@ -39,6 +39,7 @@ const NAV = {
 // ────────────────────────────────────────────
 let currentLang = localStorage.getItem('hsc-lang') || 'bn';
 let currentPath = '';
+let contentRequestId = 0;
 let sidebarOpen = false;
 
 // ────────────────────────────────────────────
@@ -73,7 +74,6 @@ function setupListeners() {
     localStorage.setItem('hsc-lang', currentLang);
     document.documentElement.lang = currentLang;
     updateLangLabels();
-    renderSidebar();
     handleRoute();
   });
 
@@ -153,13 +153,15 @@ function renderSidebar() {
 // ROUTING
 // ────────────────────────────────────────────
 function handleRoute() {
-  const hash = window.location.hash.replace(/^#\/?/, '');
-  currentPath = hash;
+  const path = window.location.hash.replace(/^#\/?/, '');
+  const keepPosition = path === currentPath;
+  currentPath = path;
 
-  if (!hash) {
+  if (!path) {
+    contentRequestId++; // Invalidate a pending note request.
     renderHomepage();
   } else {
-    loadContent(hash);
+    loadContent(path, keepPosition);
   }
 
   renderSidebar();
@@ -168,25 +170,35 @@ function handleRoute() {
 // ────────────────────────────────────────────
 // CONTENT LOADING
 // ────────────────────────────────────────────
-async function loadContent(path) {
+async function loadContent(path, keepPosition) {
+  const requestId = ++contentRequestId;
   const el = document.getElementById('content');
-  el.innerHTML = `
-    <div class="loading">
-      <div class="loading-spinner"></div>
-      <p>${currentLang === 'bn' ? 'লোড হচ্ছে...' : 'Loading...'}</p>
-    </div>`;
+  const previousNote = keepPosition ? el.querySelector('.markdown-body') : null;
+
+  // Keep the old note visible during a language switch so the page doesn't shrink.
+  if (!previousNote) {
+    el.innerHTML = `
+      <div class="loading">
+        <div class="loading-spinner"></div>
+        <p>${currentLang === 'bn' ? 'লোড হচ্ছে...' : 'Loading...'}</p>
+      </div>`;
+  }
 
   try {
     const res = await fetch(`notes/${currentLang}/${path}.md`);
     if (!res.ok) throw new Error(res.status);
     const md = await res.text();
+    if (requestId !== contentRequestId) return;
 
     // Protect math from marked parser
     const { text, blocks } = shieldMath(md);
     let html = marked.parse(text, { breaks: true, gfm: true });
     html = restoreMath(html, blocks);
 
+    const position = previousNote ? captureReadingPosition(previousNote) : null;
     el.innerHTML = `<div class="markdown-body">${html}</div>`;
+    const note = el.firstElementChild;
+    note.lang = currentLang;
 
     // Render KaTeX
     if (typeof renderMathInElement === 'function') {
@@ -199,8 +211,9 @@ async function loadContent(path) {
       });
     }
 
-    window.scrollTo({ top: 0 });
+    restoreReadingPosition(note, position);
   } catch (_) {
+    if (requestId !== contentRequestId) return;
     el.innerHTML = `
       <div class="error-page">
         <span class="error-icon">📄</span>
@@ -213,6 +226,45 @@ async function loadContent(path) {
         <a href="#/" class="back-home">${currentLang === 'bn' ? '← হোমে ফিরে যাও' : '← Back to Home'}</a>
       </div>`;
   }
+}
+
+// Translations share a heading order, but their text may wrap differently.
+// Measure progress in the section at the top of the viewport, below the fixed header.
+function getReadingSections(note) {
+  const headings = [...note.querySelectorAll('h1, h2, h3, h4, h5, h6')];
+  const readingLine = document.querySelector('.header').getBoundingClientRect().bottom;
+  return {
+    outline: headings.map((heading) => heading.tagName).join(','),
+    bounds: [
+      ...headings.map((heading) => heading.getBoundingClientRect().top - readingLine),
+      note.getBoundingClientRect().bottom - readingLine,
+    ],
+  };
+}
+
+function captureReadingPosition(note) {
+  const top = window.scrollY;
+  if (top <= 0) return { top: 0 };
+
+  const { outline, bounds } = getReadingSections(note);
+  const index = bounds.findIndex((bound) => bound > 0) - 1;
+  if (index < 0) return { top };
+
+  const start = bounds[index];
+  return { top, outline, index, progress: -start / (bounds[index + 1] - start) };
+}
+
+function restoreReadingPosition(note, position) {
+  let top = position?.top ?? 0;
+  if (position?.index !== undefined) {
+    const { outline, bounds } = getReadingSections(note);
+    if (outline === position.outline) {
+      const start = bounds[position.index];
+      const end = bounds[position.index + 1];
+      top = window.scrollY + start + position.progress * (end - start);
+    }
+  }
+  window.scrollTo({ top, behavior: 'instant' });
 }
 
 // ── Math shield helpers ──
